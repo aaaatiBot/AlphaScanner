@@ -3,8 +3,12 @@
 from abc import ABC, abstractmethod
 import os
 from typing import Any, Dict, Optional
+from dotenv import load_dotenv
 import pandas as pd
 import yfinance as yf
+
+# Load environment variables from .env file
+load_dotenv()
 
 try:
     import lse
@@ -169,9 +173,8 @@ class YFinanceProvider(MarketDataProvider):
 class LSEProvider(MarketDataProvider):
     """London Strategic Edge (LSE) Data Provider using the `lse-data` library.
 
-    NOTE: This provider requires an active LSE API key to connect to the 
-    London Strategic Edge market data feed. Obtain a key from London Strategic Edge
-    and pass it to the constructor or set the LSE_API_KEY environment variable.
+    Requires an LSE API key. Automatically loads LSE_API_KEY from environment variables or .env file.
+    Supports global market segments including 'us_stocks' and 'uk_stocks'.
     """
 
     def __init__(self, api_key: Optional[str] = None):
@@ -179,73 +182,115 @@ class LSEProvider(MarketDataProvider):
         self.client = None
         if self.api_key and lse is not None:
             try:
-                # Initialize LSE client when API key is provided
-                self.client = lse.LSE(api_key=self.api_key)
+                self.client = lse.LSE(api_key=self.api_key, timeout=10)
             except Exception:
                 self.client = None
 
-    def get_live_price(self, ticker: str) -> Dict[str, Any]:
-        """Fetch live price using lse-data API.
+    def _detect_market(self, ticker: str) -> str:
+        """Helper to determine market segment based on ticker format."""
+        clean = ticker.strip().upper()
+        if clean.endswith(".L") or clean in ["VOD", "BP", "HSBA", "AZN", "SHEL", "GSK"]:
+            return "uk_stocks"
+        return "us_stocks"
 
-        Requires an active LSE API key to run.
-        """
+    def get_live_price(self, ticker: str) -> Dict[str, Any]:
+        """Fetch live price using lse-data API."""
         if not self.api_key:
             return {
                 "ticker": ticker,
                 "current_price": None,
                 "previous_close": None,
                 "change_pct": None,
-                "currency": "GBP",
+                "currency": "USD",
                 "provider": "LSEProvider",
-                "error": "LSE API key required. Set LSE_API_KEY environment variable to use LSEProvider.",
+                "error": "LSE API key required. Set LSE_API_KEY in .env to use LSEProvider.",
             }
 
+        symbol = ticker.strip().upper().replace(".L", "")
+        market = self._detect_market(ticker)
+        currency = "GBP" if market == "uk_stocks" else "USD"
+
         try:
-            # Example API call structure with lse-data:
-            # client = self.client or lse.LSE(api_key=self.api_key)
-            # tick = client.tape(market="LSE", symbol=ticker)
-            # return {
-            #     "ticker": ticker,
-            #     "current_price": tick.price,
-            #     "previous_close": getattr(tick, "prev_close", None),
-            #     "change_pct": None,
-            #     "currency": "GBP",
-            #     "provider": "LSEProvider",
-            # }
+            client = self.client or lse.LSE(api_key=self.api_key, timeout=10)
+            candles = client.candles(symbol=symbol, market=market, timeframe="1d", limit=2)
+            if not candles:
+                return {
+                    "ticker": ticker,
+                    "current_price": None,
+                    "previous_close": None,
+                    "change_pct": None,
+                    "currency": currency,
+                    "provider": "LSEProvider",
+                    "error": f"No candle data returned for symbol '{symbol}' on market '{market}'.",
+                }
+
+            latest = candles[-1]
+            current_price = round(float(latest.get("close", 0.0)), 2)
+            prev_close = None
+            if len(candles) >= 2:
+                prev_close = round(float(candles[-2].get("close", 0.0)), 2)
+
+            change_pct = None
+            if current_price is not None and prev_close not in (None, 0):
+                change_pct = round(((current_price - prev_close) / prev_close) * 100, 2)
+            elif current_price is not None:
+                change_pct = 0.0
+
             return {
                 "ticker": ticker,
-                "current_price": None,
-                "previous_close": None,
-                "change_pct": None,
-                "currency": "GBP",
+                "current_price": current_price,
+                "previous_close": prev_close,
+                "change_pct": change_pct,
+                "currency": currency,
                 "provider": "LSEProvider",
-                "error": "Live connection not established.",
             }
+
         except Exception as exc:
             return {
                 "ticker": ticker,
                 "current_price": None,
                 "previous_close": None,
                 "change_pct": None,
-                "currency": "GBP",
+                "currency": currency,
                 "provider": "LSEProvider",
                 "error": f"LSE API error: {str(exc)}",
             }
 
     def get_historical_data(self, ticker: str, period: str = "1y") -> pd.DataFrame:
-        """Fetch historical bar data using lse-data API.
-
-        Requires an active LSE API key to run.
-        """
+        """Fetch historical bar data using lse-data API and return as standard OHLCV DataFrame."""
         if not self.api_key:
-            # Returns empty DataFrame when API key is not configured
             return pd.DataFrame()
+
+        symbol = ticker.strip().upper().replace(".L", "")
+        market = self._detect_market(ticker)
+
+        # Estimate candle limit from period
+        limit = 252 if period == "1y" else 500
 
         try:
-            # Example API call structure with lse-data:
-            # client = self.client or lse.LSE(api_key=self.api_key)
-            # bars = client.load(symbol=ticker, timeframe="1d", period=period)
-            # return pd.DataFrame(bars)
-            return pd.DataFrame()
+            client = self.client or lse.LSE(api_key=self.api_key, timeout=10)
+            candles = client.candles(symbol=symbol, market=market, timeframe="1d", limit=limit)
+            if not candles:
+                return pd.DataFrame()
+
+            df = pd.DataFrame(candles)
+            if "timestamp" in df.columns:
+                df["Date"] = pd.to_datetime(df["timestamp"])
+                df = df.set_index("Date")
+            elif "date" in df.columns:
+                df["Date"] = pd.to_datetime(df["date"])
+                df = df.set_index("Date")
+
+            rename_map = {
+                "open": "Open",
+                "high": "High",
+                "low": "Low",
+                "close": "Close",
+                "volume": "Volume",
+            }
+            df = df.rename(columns=rename_map)
+            cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+            return df[cols]
+
         except Exception:
             return pd.DataFrame()

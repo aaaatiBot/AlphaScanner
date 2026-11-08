@@ -4,3 +4,4 @@ textblob
 pandas
 lse-data
 finnhub-python
+python-dotenv
