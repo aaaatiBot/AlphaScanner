@@ -1,6 +1,15 @@
 """AlphaScanner Services Package."""
 
-from .stock_scraper import get_stock_data
+from .data_aggregator import DataAggregator
+from .market_provider import LSEProvider, MarketDataProvider, YFinanceProvider
 from .news_scraper import get_news_sentiment
+from .stock_scraper import get_stock_data
 
-__all__ = ["get_stock_data", "get_news_sentiment"]
+__all__ = [
+    "DataAggregator",
+    "MarketDataProvider",
+    "YFinanceProvider",
+    "LSEProvider",
+    "get_stock_data",
+    "get_news_sentiment",
+]

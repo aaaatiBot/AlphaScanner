@@ -2,3 +2,5 @@ yfinance
 feedparser
 textblob
 pandas
+lse-data
+finnhub-python

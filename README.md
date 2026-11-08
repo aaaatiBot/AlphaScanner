@@ -1,14 +1,19 @@
 # AlphaScanner
 
-AlphaScanner is a stock and sentiment analysis engine built in Python. This phase implements the core data scraping engine for financial metrics and news sentiment.
+AlphaScanner is a stock and sentiment analysis engine built in Python featuring a multi-source data provider architecture.
 
 ## Features
 
-- **Stock Data Scraping (`app/services/stock_scraper.py`)**:
-  - Real-time and fast market data fetching using `yfinance`.
-  - Current price, previous close, percentage change, and currency detection.
-  - 1-year historical daily OHLCV dataset loaded into Pandas DataFrames.
-  - Graceful handling of invalid and delisted tickers.
+- **Multi-Source Market Data Provider (`app/services/market_provider.py`)**:
+  - `MarketDataProvider`: Abstract base class establishing interfaces for live quotes and historical OHLCV data.
+  - `YFinanceProvider`: Default provider for global equities, supporting US tickers (e.g. `AAPL`) and Indian tickers (e.g. `RELIANCE.NS` / automatic `.NS` exchange resolution).
+  - `LSEProvider`: Integration structure for London Strategic Edge (`lse-data`), prepared for real-time fallback feeds (requires API key).
+- **Data Aggregator & Technical Analysis (`app/services/data_aggregator.py`)**:
+  - Coordinates provider data ingestion.
+  - Automatically computes technical indicators:
+    - 14-period Relative Strength Index (RSI) using Wilder's smoothing.
+    - 20-day Simple Moving Average (SMA_20).
+    - 50-day Simple Moving Average (SMA_50).
 - **News Sentiment Analysis (`app/services/news_scraper.py`)**:
   - Automated RSS feed retrieval from Google News.
   - Extraction of top news headlines for any ticker.
@@ -22,6 +27,8 @@ stonks/
 │   ├── __init__.py
 │   └── services/
 │       ├── __init__.py
+│       ├── data_aggregator.py
+│       ├── market_provider.py
 │       ├── stock_scraper.py
 │       └── news_scraper.py
 ├── .gitignore
@@ -36,9 +43,9 @@ stonks/
 pip install -r requirements.txt
 ```
 
-## Testing Scrapers
+## Testing Scrapers & Aggregator
 
-Run the scraper test script at the root:
+Run the test suite:
 
 ```bash
 python test_scrapers.py
