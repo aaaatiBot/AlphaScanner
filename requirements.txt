@@ -5,3 +5,5 @@ pandas
 lse-data
 finnhub-python
 python-dotenv
+fba-finance
+requests-cache

@@ -1,23 +1,18 @@
 # AlphaScanner
 
-AlphaScanner is a stock and sentiment analysis engine built in Python featuring a multi-source data provider architecture.
+AlphaScanner is a stock and sentiment analysis engine built in Python featuring a multi-source, battle-tested data acquisition architecture.
 
-## Features
+## Architecture Overview
 
-- **Multi-Source Market Data Provider (`app/services/market_provider.py`)**:
-  - `MarketDataProvider`: Abstract base class establishing interfaces for live quotes and historical OHLCV data.
-  - `YFinanceProvider`: Default provider for global equities, supporting US tickers (e.g. `AAPL`) and Indian tickers (e.g. `RELIANCE.NS` / automatic `.NS` exchange resolution).
-  - `LSEProvider`: Integration structure for London Strategic Edge (`lse-data`), prepared for real-time fallback feeds (requires API key).
-- **Data Aggregator & Technical Analysis (`app/services/data_aggregator.py`)**:
-  - Coordinates provider data ingestion.
-  - Automatically computes technical indicators:
-    - 14-period Relative Strength Index (RSI) using Wilder's smoothing.
-    - 20-day Simple Moving Average (SMA_20).
-    - 50-day Simple Moving Average (SMA_50).
-- **News Sentiment Analysis (`app/services/news_scraper.py`)**:
-  - Automated RSS feed retrieval from Google News.
-  - Extraction of top news headlines for any ticker.
-  - Headline sentiment polarity scoring and classification (Positive / Neutral / Negative) using `TextBlob`.
+1. **Primary Global Engine (`fba-finance`)**:
+   - Rotates automatically between providers (`yfinance`, `Twelve Data`, `Alpha Vantage`) to eliminate rate-limiting bans.
+   - Built-in multi-tier caching prevents duplicate queries.
+2. **Dedicated Indian Equities Fallback (`vendor/Hive-Mind`)**:
+   - Direct NSE & BSE tick streaming, historical data fetching, and symbol metadata.
+3. **Technical Analysis Engine (`vendor/indiaquant-mcp`)**:
+   - Native computation of 14-period RSI, MACD (line, signal, histogram), Bollinger Bands, and AI BUY/SELL/HOLD trade signals.
+4. **AI News Sentiment Engine (`Gemini AI`)**:
+   - Google News RSS headlines synthesized by Google Gemini AI with fallback to `TextBlob`.
 
 ## Project Structure
 
@@ -29,24 +24,21 @@ stonks/
 │       ├── __init__.py
 │       ├── data_aggregator.py
 │       ├── market_provider.py
+│       ├── news_scraper.py
 │       ├── stock_scraper.py
-│       └── news_scraper.py
-├── .gitignore
-├── requirements.txt
+│       └── technical_analysis.py
+├── vendor/
+│   ├── Hive-Mind/
+│   ├── indiaquant-mcp/
+│   └── Indian-Stock-Market-API/
+├── test_hybrid_engine.py
 ├── test_scrapers.py
+├── requirements.txt
 └── README.md
 ```
 
-## Installation
+## Running the Verification Suite
 
 ```bash
-pip install -r requirements.txt
-```
-
-## Testing Scrapers & Aggregator
-
-Run the test suite:
-
-```bash
-python test_scrapers.py
+python test_hybrid_engine.py
 ```

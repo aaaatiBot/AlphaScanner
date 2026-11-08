@@ -1,15 +1,41 @@
-"""Market data provider abstraction and concrete implementations for multi-source data ingestion."""
+"""Market data providers for AlphaScanner, including the primary HybridDataProvider."""
 
-from abc import ABC, abstractmethod
+import asyncio
+import concurrent.futures
 import os
+import sys
+from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional
 from dotenv import load_dotenv
 import pandas as pd
 import yfinance as yf
 
-# Load environment variables from .env file
+# Load environment variables
 load_dotenv()
 
+# Ensure standard streams support UTF-8 on Windows
+if sys.platform == "win32":
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+# Add vendor directories to sys.path
+_BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_HIVE_MIND_PATH = os.path.join(_BASE_DIR, "vendor", "Hive-Mind")
+if _HIVE_MIND_PATH not in sys.path:
+    sys.path.insert(0, _HIVE_MIND_PATH)
+
+# Primary fba-finance multi-source client
+try:
+    from fba_finance import FinanceClient
+except ImportError:
+    FinanceClient = None
+
+# Optional LSE provider
 try:
     import lse
 except ImportError:
@@ -21,67 +47,62 @@ class MarketDataProvider(ABC):
 
     @abstractmethod
     def get_live_price(self, ticker: str) -> Dict[str, Any]:
-        """Fetch current live or delayed market price information.
-
-        Args:
-            ticker: The asset ticker symbol.
-
-        Returns:
-            Dict containing ticker, current_price, previous_close, change_pct, currency, etc.
-        """
+        """Fetch current live or delayed market price information."""
         pass
 
     @abstractmethod
     def get_historical_data(self, ticker: str, period: str = "1y") -> pd.DataFrame:
-        """Fetch historical OHLCV data for the given period.
-
-        Args:
-            ticker: The asset ticker symbol.
-            period: Time span to fetch (default '1y').
-
-        Returns:
-            pd.DataFrame: OHLCV DataFrame indexed by date/datetime.
-        """
+        """Fetch historical OHLCV data for the given period."""
         pass
 
 
-class YFinanceProvider(MarketDataProvider):
-    """Market data provider using yfinance.
+class HybridDataProvider(MarketDataProvider):
+    """Hybrid market data provider combining fba-finance and Hive-Mind.
 
-    Supports global equities, including US tickers (e.g. 'AAPL') and Indian tickers
-    (e.g. 'RELIANCE.NS', with automatic '.NS' appending for Indian stocks if needed).
+    - Primary Engine: `fba_finance.FinanceClient` with built-in provider rotation (yfinance,
+      Twelve Data, Alpha Vantage) and caching to prevent rate-limiting and bans.
+    - Fallback Engine: `Hive-Mind` (`MarketDataFetcher`) specialized for Indian equities (NSE/BSE).
     """
 
-    def resolve_ticker(self, ticker: str) -> str:
-        """Normalize ticker and handle Indian exchange suffixes (.NS).
+    def __init__(self):
+        self.finance_client = FinanceClient() if FinanceClient is not None else None
 
-        If ticker doesn't contain a dot and yields no direct data, attempts appending '.NS'.
+    def _fetch_from_hive_mind(self, ticker: str) -> Optional[Dict[str, Any]]:
+        """Fallback to Hive-Mind for Indian equities (NSE / BSE)."""
+        clean = ticker.strip().upper()
+        symbol = clean.replace(".NS", "").replace(".BO", "")
+        exchange = "BSE" if clean.endswith(".BO") else "NSE"
+
+        try:
+            from market_data_fetcher import MarketDataFetcher
+            fetcher = MarketDataFetcher()
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                info = executor.submit(lambda: asyncio.run(fetcher.get_symbol_info(symbol, exchange=exchange))).result(timeout=10)
+
+            if info and info.get("current_price"):
+                current_price = round(float(info["current_price"]), 2)
+                prev_close = round(float(info.get("previous_close", current_price)), 2) if info.get("previous_close") else None
+                change_pct = round(float(info.get("change_percent", 0.0)), 2)
+                return {
+                    "ticker": ticker,
+                    "current_price": current_price,
+                    "previous_close": prev_close,
+                    "change_pct": change_pct,
+                    "currency": "INR",
+                    "source": "Hive-Mind (NSE/BSE Fallback)",
+                    "provider": "HybridDataProvider",
+                }
+        except Exception:
+            pass
+        return None
+
+    def get_quote(self, ticker: str) -> Dict[str, Any]:
+        """Fetch real-time quote for a stock.
+
+        Tries `fba-finance.FinanceClient` first.
+        If ticker ends with .NS or .BO (India) and fba-finance fails, falls back to Hive-Mind.
         """
-        clean_ticker = ticker.strip().upper()
-        if "." in clean_ticker:
-            return clean_ticker
-
-        # Test if symbol exists directly (e.g. US stock like AAPL)
-        try:
-            s = yf.Ticker(clean_ticker)
-            if not s.history(period="5d").empty:
-                return clean_ticker
-        except Exception:
-            pass
-
-        # Try appending .NS for National Stock Exchange of India
-        try:
-            ns_ticker = f"{clean_ticker}.NS"
-            ns_s = yf.Ticker(ns_ticker)
-            if not ns_s.history(period="5d").empty:
-                return ns_ticker
-        except Exception:
-            pass
-
-        return clean_ticker
-
-    def get_live_price(self, ticker: str) -> Dict[str, Any]:
-        """Fetch real-time / 15-min delayed quote data from yfinance."""
         if not ticker or not isinstance(ticker, str):
             return {
                 "ticker": ticker,
@@ -89,93 +110,203 @@ class YFinanceProvider(MarketDataProvider):
                 "previous_close": None,
                 "change_pct": None,
                 "currency": None,
-                "provider": "YFinanceProvider",
+                "source": "none",
+                "provider": "HybridDataProvider",
                 "error": "A valid non-empty string ticker must be provided.",
             }
 
-        resolved_ticker = self.resolve_ticker(ticker)
+        clean_ticker = ticker.strip().upper()
+        is_indian = clean_ticker.endswith(".NS") or clean_ticker.endswith(".BO")
 
-        try:
-            stock = yf.Ticker(resolved_ticker)
-            current_price = None
-            prev_close = None
-            currency = None
-
+        # 1. Try fba-finance FinanceClient first
+        if self.finance_client is not None:
             try:
-                fast_info = stock.fast_info
-                current_price = getattr(fast_info, "last_price", None)
-                if current_price is None:
-                    current_price = fast_info.get("lastPrice")
-                prev_close = getattr(fast_info, "previous_close", None)
-                if prev_close is None:
-                    prev_close = fast_info.get("previousClose")
-                currency = getattr(fast_info, "currency", None)
-                if currency is None:
-                    currency = fast_info.get("currency")
+                quote = self.finance_client.get_quote(clean_ticker)
+                if quote is not None and quote.price is not None:
+                    price = round(float(quote.price), 2)
+                    prev_close = round(float(quote.previous_close), 2) if quote.previous_close else None
+                    change_pct = round(float(quote.change_percent), 2) if quote.change_percent is not None else 0.0
+                    currency = quote.currency or ("INR" if is_indian else "USD")
+                    source = f"fba-finance ({quote.source or 'primary'})"
+
+                    return {
+                        "ticker": clean_ticker,
+                        "current_price": price,
+                        "previous_close": prev_close,
+                        "change_pct": change_pct,
+                        "currency": currency,
+                        "source": source,
+                        "provider": "HybridDataProvider",
+                    }
             except Exception:
                 pass
 
-            # Fallback to history close if fast_info missing
-            if current_price is None or prev_close is None:
-                hist = stock.history(period="5d")
-                if not hist.empty and "Close" in hist.columns:
-                    if current_price is None:
-                        current_price = float(hist["Close"].iloc[-1])
-                    if prev_close is None and len(hist) >= 2:
-                        prev_close = float(hist["Close"].iloc[-2])
+        # 2. If Indian ticker and primary failed, try Hive-Mind fallback
+        if is_indian:
+            hive_res = self._fetch_from_hive_mind(clean_ticker)
+            if hive_res is not None:
+                return hive_res
 
-            change_pct = None
-            if current_price is not None and prev_close not in (None, 0):
+        # 3. Final yfinance fallback if needed
+        try:
+            s = yf.Ticker(clean_ticker)
+            fast_info = s.fast_info
+            price = round(float(fast_info.last_price), 2) if fast_info.last_price else None
+            prev_close = round(float(fast_info.previous_close), 2) if fast_info.previous_close else None
+            change_pct = round(((price - prev_close) / prev_close) * 100, 2) if price and prev_close else 0.0
+            currency = fast_info.currency or ("INR" if is_indian else "USD")
+
+            return {
+                "ticker": clean_ticker,
+                "current_price": price,
+                "previous_close": prev_close,
+                "change_pct": change_pct,
+                "currency": currency,
+                "source": "yfinance (direct fallback)",
+                "provider": "HybridDataProvider",
+            }
+        except Exception as exc:
+            return {
+                "ticker": clean_ticker,
+                "current_price": None,
+                "previous_close": None,
+                "change_pct": None,
+                "currency": "INR" if is_indian else "USD",
+                "source": "none",
+                "provider": "HybridDataProvider",
+                "error": f"Failed to fetch quote for '{ticker}': {str(exc)}",
+            }
+
+    def get_live_price(self, ticker: str) -> Dict[str, Any]:
+        """Alias for get_quote to satisfy MarketDataProvider interface."""
+        return self.get_quote(ticker)
+
+    def get_historical_data(self, ticker: str, period: str = "1y") -> pd.DataFrame:
+        """Fetch historical daily OHLCV data using fba-finance's built-in caching."""
+        if not ticker or not isinstance(ticker, str):
+            return pd.DataFrame()
+
+        clean_ticker = ticker.strip().upper()
+        is_indian = clean_ticker.endswith(".NS") or clean_ticker.endswith(".BO")
+
+        # 1. Try fba-finance with built-in caching
+        if self.finance_client is not None:
+            try:
+                hist = self.finance_client.get_historical(clean_ticker, period=period)
+                if hist and hasattr(hist, "data") and isinstance(hist.data, pd.DataFrame) and not hist.data.empty:
+                    df = hist.data.copy()
+                    rename_map = {
+                        "open": "Open",
+                        "high": "High",
+                        "low": "Low",
+                        "close": "Close",
+                        "volume": "Volume",
+                        "date": "Date",
+                    }
+                    df = df.rename(columns=rename_map)
+                    if "Date" in df.columns:
+                        df["Date"] = pd.to_datetime(df["Date"])
+                        df = df.set_index("Date")
+                    cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+                    return df[cols]
+            except Exception:
+                pass
+
+        # 2. Try Hive-Mind fallback for Indian stocks
+        if is_indian:
+            symbol = clean_ticker.replace(".NS", "").replace(".BO", "")
+            exchange = "BSE" if clean_ticker.endswith(".BO") else "NSE"
+            try:
+                from market_data_fetcher import MarketDataFetcher
+                fetcher = MarketDataFetcher()
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    records = executor.submit(lambda: asyncio.run(fetcher.get_historical_data(symbol, exchange=exchange, interval="1D"))).result(timeout=10)
+                if records:
+                    df = pd.DataFrame(records)
+                    if "timestamp" in df.columns:
+                        df["Date"] = pd.to_datetime(df["timestamp"])
+                        df = df.set_index("Date")
+                    rename_map = {"open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"}
+                    df = df.rename(columns=rename_map)
+                    cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+                    return df[cols]
+            except Exception:
+                pass
+
+        # 3. Direct yfinance fallback
+        try:
+            stock = yf.Ticker(clean_ticker)
+            return stock.history(period=period)
+        except Exception:
+            return pd.DataFrame()
+
+
+class YFinanceProvider(MarketDataProvider):
+    """Direct yfinance provider with Indian exchange suffix resolution."""
+
+    def resolve_ticker(self, ticker: str) -> str:
+        clean_ticker = ticker.strip().upper()
+        if "." in clean_ticker:
+            return clean_ticker
+        try:
+            s = yf.Ticker(clean_ticker)
+            if not s.history(period="5d").empty:
+                return clean_ticker
+        except Exception:
+            pass
+        try:
+            ns_ticker = f"{clean_ticker}.NS"
+            ns_s = yf.Ticker(ns_ticker)
+            if not ns_s.history(period="5d").empty:
+                return ns_ticker
+        except Exception:
+            pass
+        return clean_ticker
+
+    def get_live_price(self, ticker: str) -> Dict[str, Any]:
+        resolved = self.resolve_ticker(ticker)
+        try:
+            stock = yf.Ticker(resolved)
+            fast_info = stock.fast_info
+            current_price = getattr(fast_info, "last_price", None) or fast_info.get("lastPrice")
+            prev_close = getattr(fast_info, "previous_close", None) or fast_info.get("previousClose")
+            currency = getattr(fast_info, "currency", None) or fast_info.get("currency")
+
+            change_pct = 0.0
+            if current_price and prev_close:
                 change_pct = round(((current_price - prev_close) / prev_close) * 100, 2)
                 current_price = round(float(current_price), 2)
-            elif current_price is not None:
-                current_price = round(float(current_price), 2)
-                change_pct = 0.0
-
-            if prev_close is not None:
                 prev_close = round(float(prev_close), 2)
 
             return {
-                "ticker": resolved_ticker,
+                "ticker": resolved,
                 "current_price": current_price,
                 "previous_close": prev_close,
                 "change_pct": change_pct,
                 "currency": currency,
                 "provider": "YFinanceProvider",
             }
-
         except Exception as exc:
             return {
-                "ticker": resolved_ticker,
+                "ticker": resolved,
                 "current_price": None,
                 "previous_close": None,
                 "change_pct": None,
                 "currency": None,
                 "provider": "YFinanceProvider",
-                "error": f"Failed to fetch live price for '{ticker}': {str(exc)}",
+                "error": str(exc),
             }
 
     def get_historical_data(self, ticker: str, period: str = "1y") -> pd.DataFrame:
-        """Fetch historical daily OHLCV data."""
-        if not ticker or not isinstance(ticker, str):
-            return pd.DataFrame()
-
-        resolved_ticker = self.resolve_ticker(ticker)
-
+        resolved = self.resolve_ticker(ticker)
         try:
-            stock = yf.Ticker(resolved_ticker)
-            df = stock.history(period=period)
-            return df
+            return yf.Ticker(resolved).history(period=period)
         except Exception:
             return pd.DataFrame()
 
 
 class LSEProvider(MarketDataProvider):
-    """London Strategic Edge (LSE) Data Provider using the `lse-data` library.
-
-    Requires an LSE API key. Automatically loads LSE_API_KEY from environment variables or .env file.
-    Supports global market segments including 'us_stocks' and 'uk_stocks'.
-    """
+    """London Strategic Edge (LSE) Data Provider using the `lse-data` library."""
 
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key or os.getenv("LSE_API_KEY")
@@ -187,14 +318,12 @@ class LSEProvider(MarketDataProvider):
                 self.client = None
 
     def _detect_market(self, ticker: str) -> str:
-        """Helper to determine market segment based on ticker format."""
         clean = ticker.strip().upper()
         if clean.endswith(".L") or clean in ["VOD", "BP", "HSBA", "AZN", "SHEL", "GSK"]:
             return "uk_stocks"
         return "us_stocks"
 
     def get_live_price(self, ticker: str) -> Dict[str, Any]:
-        """Fetch live price using lse-data API."""
         if not self.api_key:
             return {
                 "ticker": ticker,
@@ -203,7 +332,7 @@ class LSEProvider(MarketDataProvider):
                 "change_pct": None,
                 "currency": "USD",
                 "provider": "LSEProvider",
-                "error": "LSE API key required. Set LSE_API_KEY in .env to use LSEProvider.",
+                "error": "LSE API key required.",
             }
 
         symbol = ticker.strip().upper().replace(".L", "")
@@ -221,20 +350,16 @@ class LSEProvider(MarketDataProvider):
                     "change_pct": None,
                     "currency": currency,
                     "provider": "LSEProvider",
-                    "error": f"No candle data returned for symbol '{symbol}' on market '{market}'.",
+                    "error": f"No candle data returned for symbol '{symbol}'.",
                 }
 
             latest = candles[-1]
             current_price = round(float(latest.get("close", 0.0)), 2)
-            prev_close = None
-            if len(candles) >= 2:
-                prev_close = round(float(candles[-2].get("close", 0.0)), 2)
+            prev_close = round(float(candles[-2].get("close", 0.0)), 2) if len(candles) >= 2 else None
 
-            change_pct = None
-            if current_price is not None and prev_close not in (None, 0):
+            change_pct = 0.0
+            if current_price and prev_close:
                 change_pct = round(((current_price - prev_close) / prev_close) * 100, 2)
-            elif current_price is not None:
-                change_pct = 0.0
 
             return {
                 "ticker": ticker,
@@ -244,7 +369,6 @@ class LSEProvider(MarketDataProvider):
                 "currency": currency,
                 "provider": "LSEProvider",
             }
-
         except Exception as exc:
             return {
                 "ticker": ticker,
@@ -253,18 +377,15 @@ class LSEProvider(MarketDataProvider):
                 "change_pct": None,
                 "currency": currency,
                 "provider": "LSEProvider",
-                "error": f"LSE API error: {str(exc)}",
+                "error": str(exc),
             }
 
     def get_historical_data(self, ticker: str, period: str = "1y") -> pd.DataFrame:
-        """Fetch historical bar data using lse-data API and return as standard OHLCV DataFrame."""
         if not self.api_key:
             return pd.DataFrame()
 
         symbol = ticker.strip().upper().replace(".L", "")
         market = self._detect_market(ticker)
-
-        # Estimate candle limit from period
         limit = 252 if period == "1y" else 500
 
         try:
@@ -281,16 +402,9 @@ class LSEProvider(MarketDataProvider):
                 df["Date"] = pd.to_datetime(df["date"])
                 df = df.set_index("Date")
 
-            rename_map = {
-                "open": "Open",
-                "high": "High",
-                "low": "Low",
-                "close": "Close",
-                "volume": "Volume",
-            }
+            rename_map = {"open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"}
             df = df.rename(columns=rename_map)
             cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
             return df[cols]
-
         except Exception:
             return pd.DataFrame()

@@ -1,100 +1,85 @@
-"""Data Aggregator service coordinating market providers and technical analysis."""
+"""Data Aggregator service coordinating HybridDataProvider, IndiaQuant technicals, and Gemini AI news sentiment."""
 
 from typing import Any, Dict, Optional
 import pandas as pd
 
-from .market_provider import MarketDataProvider, YFinanceProvider
+from .market_provider import HybridDataProvider, MarketDataProvider
+from .news_scraper import get_news_sentiment
+from .technical_analysis import (
+    calculate_bollinger_bands,
+    calculate_macd,
+    calculate_rsi,
+    generate_trade_signal,
+)
 
 
 class DataAggregator:
-    """Aggregates market data from configurable providers and calculates technical indicators."""
+    """Aggregates market data from HybridDataProvider, computes technical indicators via IndiaQuant,
+
+    and analyzes news sentiment using Gemini AI.
+    """
 
     def __init__(self, provider: Optional[MarketDataProvider] = None):
-        """Initialize aggregator with a market data provider.
+        """Initialize aggregator. Defaults to HybridDataProvider for anti-rate-limiting rotation and fallbacks."""
+        self.provider: MarketDataProvider = provider if provider is not None else HybridDataProvider()
 
-        Args:
-            provider: Concrete MarketDataProvider instance. Defaults to YFinanceProvider.
-        """
-        self.provider: MarketDataProvider = provider if provider is not None else YFinanceProvider()
+    def get_stock_analysis(self, ticker: str, include_news: bool = True) -> Dict[str, Any]:
+        """Fetch quote and historical data, calculate technical indicators and AI signals.
 
-    @staticmethod
-    def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
-        """Calculate the Relative Strength Index (RSI) using standard Wilder's smoothing.
-
-        Args:
-            series: Price series (typically Close price).
-            period: Smoothing period (default 14).
-
-        Returns:
-            pd.Series: RSI series bounded between 0 and 100.
-        """
-        delta = series.diff()
-        gain = delta.clip(lower=0)
-        loss = -delta.clip(upper=0)
-
-        avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-        avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-
-        rs = avg_gain / avg_loss
-        rsi = 100 - (100 / (1 + rs))
-        return rsi
-
-    def get_stock_analysis(self, ticker: str) -> Dict[str, Any]:
-        """Fetch live quote and 1-year historical data, and compute technical indicators (RSI, SMA).
+        Pipeline:
+        1. HybridDataProvider fetches live price (fba-finance rotation / Hive-Mind fallback).
+        2. HybridDataProvider fetches cached 1-year historical data.
+        3. IndiaQuant computes RSI, MACD, Bollinger Bands, and AI Trade Signals.
+        4. Gemini AI analyzes top news headlines.
 
         Args:
             ticker: The asset ticker symbol (e.g. 'AAPL', 'RELIANCE.NS').
+            include_news: Whether to fetch and synthesize news sentiment (default True).
 
         Returns:
-            dict containing:
-                - ticker (str): The requested ticker.
-                - live_price (dict): Output from the provider's get_live_price.
-                - history_df (pd.DataFrame): 1-year history with SMA_20, SMA_50, and RSI_14.
-                - indicators (dict): Latest calculated RSI and SMA values.
-                - error (str, optional): Error message if fetching fails.
+            Dict containing live_price, history_df, technicals, and sentiment.
         """
+        # 1. Fetch live quote
         live_price_data = self.provider.get_live_price(ticker)
+
+        # 2. Fetch cached historical OHLCV data
         history_df = self.provider.get_historical_data(ticker, period="1y")
 
-        if history_df.empty or "Close" not in history_df.columns:
-            return {
-                "ticker": live_price_data.get("ticker", ticker),
-                "live_price": live_price_data,
-                "history_df": history_df,
-                "indicators": {
-                    "rsi": None,
-                    "sma_20": None,
-                    "sma_50": None,
-                },
-                "error": f"No historical price data available for '{ticker}'.",
-            }
+        technicals: Dict[str, Any] = {
+            "rsi": None,
+            "macd": {"macd": 0.0, "signal": 0.0, "histogram": 0.0},
+            "bollinger_bands": {"upper": 0.0, "middle": 0.0, "lower": 0.0},
+            "trade_signal": {"signal": "NEUTRAL", "confidence": 0.5, "reasons": []},
+            "sma_20": None,
+            "sma_50": None,
+        }
 
-        df = history_df.copy()
+        # 3. Compute indicators using IndiaQuant
+        if not history_df.empty and "Close" in history_df.columns:
+            closes = history_df["Close"].dropna()
+            if len(closes) >= 14:
+                technicals["rsi"] = calculate_rsi(closes)
+                technicals["macd"] = calculate_macd(closes)
+                technicals["bollinger_bands"] = calculate_bollinger_bands(closes)
+                technicals["trade_signal"] = generate_trade_signal(ticker, closes=closes)
 
-        # Calculate Simple Moving Averages
-        df["SMA_20"] = df["Close"].rolling(window=20).mean()
-        df["SMA_50"] = df["Close"].rolling(window=50).mean()
+                # Add moving averages
+                history_df["SMA_20"] = history_df["Close"].rolling(window=20).mean()
+                history_df["SMA_50"] = history_df["Close"].rolling(window=50).mean()
+                valid_sma20 = history_df["SMA_20"].dropna()
+                valid_sma50 = history_df["SMA_50"].dropna()
+                technicals["sma_20"] = round(float(valid_sma20.iloc[-1]), 2) if not valid_sma20.empty else None
+                technicals["sma_50"] = round(float(valid_sma50.iloc[-1]), 2) if not valid_sma50.empty else None
 
-        # Calculate 14-day RSI
-        df["RSI_14"] = self.calculate_rsi(df["Close"], period=14)
-
-        # Extract latest indicator metrics
-        valid_rsi = df["RSI_14"].dropna()
-        latest_rsi = round(float(valid_rsi.iloc[-1]), 2) if not valid_rsi.empty else None
-
-        valid_sma_20 = df["SMA_20"].dropna()
-        latest_sma_20 = round(float(valid_sma_20.iloc[-1]), 2) if not valid_sma_20.empty else None
-
-        valid_sma_50 = df["SMA_50"].dropna()
-        latest_sma_50 = round(float(valid_sma_50.iloc[-1]), 2) if not valid_sma_50.empty else None
+        # 4. Fetch News Sentiment via Gemini AI
+        sentiment: Dict[str, Any] = {}
+        if include_news:
+            sentiment = get_news_sentiment(ticker)
 
         return {
             "ticker": live_price_data.get("ticker", ticker),
             "live_price": live_price_data,
-            "history_df": df,
-            "indicators": {
-                "rsi": latest_rsi,
-                "sma_20": latest_sma_20,
-                "sma_50": latest_sma_50,
-            },
+            "history_df": history_df,
+            "technicals": technicals,
+            "sentiment": sentiment,
         }
